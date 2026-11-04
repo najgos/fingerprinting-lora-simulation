@@ -23,6 +23,12 @@ class Environment:
     correlation_distance: float   # m, shadowing correlation falls to 1/e (exponential model)
     k_factor_db: float            # Ricean K of the multipath at a fixed position
     frame_noise_sigma: float      # dB, frame-to-frame variation at one position (assumption)
+    dynamic_share: float = 0.0    # share of the multipath power that changes from frame to frame (0..1)
+    station_correlation: float = 0.0     # correlation of the shadowing between any two stations (0..1)
+    sigma_includes_fading: bool = False  # sigma is the total spread of single frames around the
+                                         # path-loss curve; the shadowing used is what remains
+    path_loss_model: str = "Log-distance"   # or "Two-ray" (d0, PL(d0) and n are then not used)
+    ground: str = "Medium dry ground"       # ground type for the two-ray model (ITU-R P.2040)
 
 
 @dataclass(frozen=True)
@@ -33,24 +39,40 @@ class Preset:
 
 
 ENVIRONMENTS = {
+    "Open area, line of sight (two-ray)": Preset(
+        Environment(1.0, reference_loss_db(868.0), 2.0, 4.0, 10.0, 9.0, 2.0,
+                    station_correlation=0.5, path_loss_model="Two-ray", ground="Medium dry ground"),
+        "Open ground without buildings, small obstacles only (benches). Mean loss: two-ray model, "
+        "direct wave plus the wave reflected by flat ground; ground: ITU-R P.2040 Table 3 (given "
+        "for 1-10 GHz, used slightly below). Shadowing 4 dB, correlation distance 10 m and Ricean "
+        "K 9 dB: 3GPP TR 38.901 UMi LOS (made for base stations at 10 m, so a starting point to "
+        "check with measurements). Station correlation 0.5: 3GPP TR 36.942. Frame noise: assumption.",
+        None),
     "Free space (ITU-R P.525)": Preset(
         Environment(1.0, reference_loss_db(868.0), 2.0, 0.0, 13.0, K_NONE, 0.0),
         "Free-space loss, ITU-R P.525. No shadowing, no multipath, no frame noise.",
         None),
+    # Both published models have one random term (the shadowing), so their sigma is the whole spread
+    # of the measured values around the curve: sigma_includes_fading=True.
     "Built-up, indoor nodes (Bor 2016)": Preset(
-        Environment(40.0, 127.41, 2.08, 3.57, 13.0, K_RAYLEIGH, 2.0),
-        "Path loss and shadowing: Bor et al., MSWiM 2016 (Lancaster, built-up, indoor nodes, "
-        "range about 100 m). Correlation distance: 3GPP TR 38.901 UMi NLOS. Rayleigh fading: "
-        "3GPP NLOS. Frame noise: assumption.",
+        Environment(40.0, 127.41, 2.08, 3.57, 13.0, K_NONE, 2.0,
+                    station_correlation=0.5, sigma_includes_fading=True),
+        "Path loss and sigma: Bor et al., MSWiM 2016 (Lancaster, built-up, indoor nodes, range "
+        "about 100 m); the model has one random term, so sigma 3.57 dB is the total spread. "
+        "Rayleigh fading (5.6 dB alone) does not fit into it, so no separate multipath. "
+        "Correlation distance: 3GPP TR 38.901 UMi NLOS. Station correlation 0.5: 3GPP TR 36.942. "
+        "Frame noise: assumption.",
         (40.0, 100.0)),
     "Urban, rooftop gateways (Rademacher 2021)": Preset(
-        Environment(1000.0, 132.41, 1.58, 9.9, 50.0, K_RAYLEIGH, 2.0),
-        "Path loss and shadowing: Rademacher et al., VTC2021-Fall (Bonn, gateways on roofs and "
-        "poles, links up to 13 km, mean 3 km). Correlation distance: 3GPP TR 38.901 UMa NLOS. "
-        "Rayleigh fading: 3GPP NLOS. Frame noise: assumption.",
+        Environment(1000.0, 132.41, 1.58, 9.9, 50.0, K_RAYLEIGH, 2.0,
+                    station_correlation=0.5, sigma_includes_fading=True),
+        "Path loss and sigma: Rademacher et al., VTC2021-Fall (Bonn, gateways on roofs and "
+        "poles, links up to 13 km, mean 3 km); sigma 9.9 dB taken as the total spread. "
+        "Correlation distance: 3GPP TR 38.901 UMa NLOS. Rayleigh fading: 3GPP NLOS. "
+        "Station correlation 0.5: 3GPP TR 36.942. Frame noise: assumption.",
         (1000.0, 13000.0)),
 }
-DEFAULT_ENVIRONMENT = "Built-up, indoor nodes (Bor 2016)"
+DEFAULT_ENVIRONMENT = "Open area, line of sight (two-ray)"
 
 # ERC/REC 70-03 Annex 1: duty cycle and maximum e.r.p.
 SUB_BANDS = {
@@ -97,10 +119,14 @@ class Config:
     grid_spacing: float = 5.0            # m
     station_layout: str = "Corners"
     manual_stations: tuple = ((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0))
+    station_height: float = 2.0          # m above ground, station antennas (assumption)
+    receiver_height: float = 1.2         # m above ground, hand-held receiver (assumption)
     radio: Radio = field(default_factory=Radio)
     env: Environment = ENVIRONMENTS[DEFAULT_ENVIRONMENT].env
     scan_frames: int = 200               # frames per station at every grid point
     locate_frames: int = 20              # frames per station for one localization
+    scan_positions: int = 1              # receiver positions around a grid node (more than half a
+    locate_positions: int = 1            # wavelength apart); frames are spread over them in turn
     test_points: int = 500
     algorithm: str = "WkNN"
     k: int = 4

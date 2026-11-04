@@ -1,4 +1,5 @@
 """Scan, localization and accuracy evaluation."""
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -57,6 +58,21 @@ class Scenario:
     airtime_ms: float           # one frame on air
     slot_ms: float              # one frame plus the guard gap
     rngs: dict
+    shadow_sigma: float         # shadowing sigma actually used (dB)
+    sigma_consistent: bool      # False: the given total sigma is smaller than fading plus frame noise
+
+
+def shadowing_sigma_used(env):
+    """Shadowing sigma to simulate, and whether the settings are consistent.
+
+    With sigma_includes_fading the given sigma is the total spread of single frames, so the
+    multipath and frame-noise spread are taken out of it: sigma_s^2 = sigma^2 - sigma_mp^2 - sigma_n^2.
+    """
+    if not env.sigma_includes_fading:
+        return env.shadowing_sigma, True
+    _, fading = propagation.fading_stats_db(env.k_factor_db, env.dynamic_share, K_RAYLEIGH, K_NONE)
+    rest = env.shadowing_sigma ** 2 - fading ** 2 - env.frame_noise_sigma ** 2
+    return math.sqrt(max(rest, 0.0)), rest >= -1e-9
 
 
 def build_scenario(cfg):
@@ -64,19 +80,25 @@ def build_scenario(cfg):
     if points > MAX_GRID_POINTS:
         raise GridTooLarge(points)
     seq = np.random.SeedSequence(cfg.seed)
-    names = ("stations", "shadow", "reserved", "tests", "scan", "locate")   # order fixed: same seed, same terrain
+    names = ("stations", "shadow", "common_shadow", "tests", "scan", "locate")   # order fixed: same seed, same terrain
     rngs = {n: np.random.default_rng(s) for n, s in zip(names, seq.spawn(len(names)))}
 
     env, r = cfg.env, cfg.radio
     stations = station_positions(cfg, rngs["stations"])
-    shadow = [propagation.ShadowField(cfg.width, cfg.height, env.shadowing_sigma,
-                                      env.correlation_distance, rngs["shadow"]) for _ in stations]
+    sigma, consistent = shadowing_sigma_used(env)
+    shadow = [propagation.ShadowField(cfg.width, cfg.height, sigma, env.correlation_distance, rngs["shadow"])
+              for _ in stations]
+    if env.station_correlation > 0 and sigma > 0:
+        common = propagation.ShadowField(cfg.width, cfg.height, sigma, env.correlation_distance,
+                                         rngs["common_shadow"])
+        shadow = [propagation.CorrelatedShadow(common, own, env.station_correlation) for own in shadow]
     gx, gy = grid_axis(cfg.width, cfg.grid_spacing), grid_axis(cfg.height, cfg.grid_spacing)
     xx, yy = np.meshgrid(gx, gy)
     airtime = radio.time_on_air_ms(r.spreading_factor, r.bandwidth_khz, r.payload_bytes)
     return Scenario(cfg, stations, gx, gy, np.column_stack([xx.ravel(), yy.ravel()]),
                     shadow, radio.noise_floor_dbm(r.bandwidth_khz, r.noise_figure_db),
-                    radio.SNR_LIMIT_DB[r.spreading_factor], airtime, airtime + r.guard_ms, rngs)
+                    radio.SNR_LIMIT_DB[r.spreading_factor], airtime, airtime + r.guard_ms, rngs,
+                    sigma, consistent)
 
 
 def link_distances(sc, points):
@@ -89,7 +111,8 @@ def mean_power(sc, points):
     out = np.empty((len(points), len(sc.stations)))
     for s, st in enumerate(sc.stations):
         d = np.hypot(points[:, 0] - st[0], points[:, 1] - st[1])
-        p = r.tx_power_dbm + 2 * r.antenna_gain_dbi - propagation.path_loss_db(d, cfg.env, r.frequency_mhz)
+        p = r.tx_power_dbm + 2 * r.antenna_gain_dbi - propagation.link_loss_db(
+            d, cfg.station_height, cfg.receiver_height, cfg.env, r.frequency_mhz)
         p -= sc.shadow[s](points[:, 0], points[:, 1])
         out[:, s] = p
     return out
@@ -103,11 +126,26 @@ class Measurement:
     frames: int
 
 
-def measure(sc, points, frames, rng):
-    """The receiver stands at each point and averages `frames` frames from every station."""
+def measure(sc, points, frames, rng, positions=1):
+    """The receiver stands at each point and averages `frames` frames from every station.
+
+    Multipath: every receiver position has its own fixed part (Rice with the K-factor); a share
+    env.dynamic_share of the multipath power is new in every frame. With several positions the
+    receiver is moved around the point (positions more than half a wavelength apart, close
+    compared with the shadowing correlation distance) and the frames are spread over them in turn,
+    so averaging also reduces the fixed part.
+    """
     env = sc.cfg.env
     base = mean_power(sc, points)
-    base += propagation.multipath_db(env.k_factor_db, base.shape, rng, K_RAYLEIGH, K_NONE)
+    n_pos = max(1, min(int(positions), frames))
+    share = env.dynamic_share
+    shape = base.shape + (n_pos,)
+    if share > 0:
+        fixed = propagation.rice_amplitude(env.k_factor_db, shape, rng, K_RAYLEIGH, K_NONE)
+        offset = propagation.fading_stats_db(env.k_factor_db, share, K_RAYLEIGH, K_NONE)[0]
+    else:
+        fixed = propagation.multipath_db(env.k_factor_db, shape, rng, K_RAYLEIGH, K_NONE)
+    position_of_frame = np.arange(frames) % n_pos
     n_st = base.shape[1]
     rssi = np.empty_like(base)
     snr = np.empty_like(base)
@@ -115,7 +153,12 @@ def measure(sc, points, frames, rng):
     chunk = max(1, MAX_SAMPLES_PER_CHUNK // (n_st * frames))
     for a in range(0, len(points), chunk):
         b = slice(a, a + chunk)
-        power = base[b, :, None] + rng.normal(0.0, env.frame_noise_sigma, (len(base[b]), n_st, frames))
+        if share > 0:
+            multipath = propagation.dynamic_gain_db(fixed[b][:, :, position_of_frame], share, rng) - offset
+        else:
+            multipath = fixed[b][:, :, position_of_frame]
+        power = (base[b, :, None] + multipath
+                 + rng.normal(0.0, env.frame_noise_sigma, (len(base[b]), n_st, frames)))
         snr_true = power - sc.noise_floor
         ok = snr_true >= sc.snr_limit
         count = ok.sum(axis=2)
@@ -175,11 +218,11 @@ class Result:
 def simulate(cfg, algorithms=None, test_points=None):
     algorithms = algorithms or (cfg.algorithm,)
     sc = build_scenario(cfg)
-    scan = measure(sc, sc.grid, cfg.scan_frames, sc.rngs["scan"])
+    scan = measure(sc, sc.grid, cfg.scan_frames, sc.rngs["scan"], cfg.scan_positions)
     if test_points is None:
         test_points = sc.rngs["tests"].uniform((0, 0), (cfg.width, cfg.height), size=(cfg.test_points, 2))
     test_points = np.asarray(test_points, dtype=float)
-    located = measure(sc, test_points, cfg.locate_frames, sc.rngs["locate"])
+    located = measure(sc, test_points, cfg.locate_frames, sc.rngs["locate"], cfg.locate_positions)
 
     estimates = {}
     for alg in algorithms:

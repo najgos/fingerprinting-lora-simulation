@@ -11,9 +11,10 @@ from matplotlib.patches import Rectangle
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from lorasim import radio
-from lorasim.config import (ALGORITHMS, ENVIRONMENTS, FEATURES, K_NONE, K_RAYLEIGH, MAX_GRID_POINTS,
-                            STATION_LAYOUTS, SUB_BANDS, Config, Environment, Radio)
-from lorasim.simulation import actual_spacing, grid_axis, grid_size, simulate
+from lorasim.config import (ALGORITHMS, DEFAULT_ENVIRONMENT, ENVIRONMENTS, FEATURES, K_NONE, K_RAYLEIGH,
+                            MAX_GRID_POINTS, STATION_LAYOUTS, SUB_BANDS, Config, Environment, Radio)
+from lorasim.propagation import GROUND_TYPES, PATH_LOSS_MODELS
+from lorasim.simulation import actual_spacing, grid_axis, grid_size, shadowing_sigma_used, simulate
 from lorasim.sweep import LOG_AXIS, PARAMETERS, UNITS, run_sweep
 
 COLORS = {"WkNN": "#1f77b4", "NN": "#2ca02c"}
@@ -34,16 +35,43 @@ TIPS = {
           "SX1262 (instantaneous RSSI while no station transmits).",
     "snr_max": "ASSUMPTION (no source): highest packet SNR the SX1262 reports. Measure it with two "
                "boards close to each other.",
-    "d0": "Reference distance of the log-distance model. Default: Bor et al. 2016.",
-    "pl0": "Mean path loss at the reference distance. Default: Bor et al. 2016.",
-    "n": "Path-loss exponent. Default: Bor et al. 2016.",
-    "shadow": "Log-normal shadowing standard deviation. Default: Bor et al. 2016.",
+    "d0": "Reference distance of the log-distance model (source: see the preset).",
+    "pl0": "Mean path loss at the reference distance (source: see the preset).",
+    "n": "Path-loss exponent of the log-distance model (source: see the preset).",
+    "shadow": "Log-normal shadowing standard deviation, or the total spread when the box below is "
+              "ticked. Default: Bor et al. 2016, 3.57 dB total spread.",
     "corr": "Distance at which shadowing correlation falls to 1/e. Exponential model "
             "(Gudmundson 1991; 3GPP TR 38.901). Default 13 m: 3GPP TR 38.901 Table 7.5-6, UMi NLOS.",
     "k": "Ricean K-factor of the multipath at a fixed position. 3GPP TR 38.901 Table 7.5-6: "
          "LOS 7-9 dB, NLOS Rayleigh. At the minimum: Rayleigh; 40 dB or more: no multipath.",
     "noise": "ASSUMPTION (no source): frame-to-frame variation at one position. Measure it with "
              "the real boards (static link, several minutes).",
+    "dynamic": "ASSUMPTION (no source): share of the multipath power that changes from frame to frame "
+               "(people, vehicles, leaves). 0 %: the multipath at a position never changes, so more "
+               "frames do not reduce it; 100 %: new fading in every frame. Measure it with a static "
+               "link: spread of single frames versus spread of the per-position means.",
+    "station_corr": "Correlation of the shadowing between any two stations: obstacles near the "
+                    "receiver shadow the links to several stations at once. 0.5: 3GPP TR 36.942 "
+                    "(between base station sites); 0: independent.",
+    "sigma_total": "On: the shadowing σ above is the total spread of single frames around the "
+                   "path-loss curve (published models with one random term, e.g. Bor 2016). The "
+                   "multipath and frame-noise spread are then taken out of it. Off: σ is the "
+                   "shadowing alone.",
+    "preset": "Parameter sets with their sources. Choosing one fills the fields below; every field "
+              "can then be changed.",
+    "model": "Log-distance: PL(d0) + 10 n log10(d/d0) on the 3-D distance, fitted to measurements. "
+             "Two-ray: direct wave plus the wave reflected by flat ground, from the antenna heights "
+             "and the ground type (open ground with line of sight; d0, PL(d0) and n are not used).",
+    "ground": "Ground under the links, for the reflected wave of the two-ray model. Permittivity and "
+              "conductivity: ITU-R P.2040 Table 3 (given for 1-10 GHz, used slightly below at 868 MHz).",
+    "station_height": "ASSUMPTION: height of the station antennas above ground. With the two-ray model "
+                      "it sets the breakpoint 4 h_station h_receiver / wavelength (28 m for 2 m and 1.2 m).",
+    "receiver_height": "ASSUMPTION: height at which the receiver is held. Keep it the same for the scan "
+                       "and for localization: 1.0 m instead of 1.2 m changes the two-ray loss by about "
+                       "1 dB on average and up to 5 dB near the stations.",
+    "positions": "Receiver positions around the point, more than half a wavelength (17 cm) apart, "
+                 "e.g. within 1 m. The frames are spread over the positions in turn, so averaging "
+                 "also reduces the fixed multipath. 1: the receiver does not move.",
 }
 
 
@@ -172,8 +200,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.table.setFixedHeight(150)
         self._fill_table(d.manual_stations)
+        self.station_height = dspin(0.2, 30, d.station_height, 0.1, 1, " m")
+        self.receiver_height = dspin(0.2, 10, d.receiver_height, 0.1, 1, " m")
+        self.station_height.setToolTip(TIPS["station_height"])
+        self.receiver_height.setToolTip(TIPS["receiver_height"])
         f.addRow("Layout", self.layout_)
         f.addRow(self.table)
+        f.addRow("Station antenna height", self.station_height)
+        f.addRow("Receiver height", self.receiver_height)
 
         g, f = self._group("Radio (868 MHz)", form)
         r = d.radio
@@ -203,6 +237,12 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow(self.radio_info)
 
         g, f = self._group("Propagation", form)
+        self.preset = combo(ENVIRONMENTS, DEFAULT_ENVIRONMENT)
+        self.preset.setToolTip(TIPS["preset"])
+        self.model = combo(PATH_LOSS_MODELS)
+        self.model.setToolTip(TIPS["model"])
+        self.ground = combo(GROUND_TYPES)
+        self.ground.setToolTip(TIPS["ground"])
         self.d0 = dspin(1, 10000, 1, 1, 0, " m")
         self.pl0 = dspin(20, 200, 100, 0.1, 2, " dB")
         self.n = dspin(1.0, 6, 2, 0.1, 2)
@@ -211,25 +251,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.kf = dspin(K_RAYLEIGH, K_NONE, K_RAYLEIGH, 1, 0, " dB")
         self.kf.setSpecialValueText("Rayleigh (no LOS)")
         self.noise = dspin(0, 10, 0, 0.5, 1, " dB")
+        self.dynamic = dspin(0, 100, 0, 5, 0, " %")
+        self.station_corr = dspin(0, 0.95, 0, 0.05, 2)
+        self.sigma_total = QtWidgets.QCheckBox("σ is the total spread (includes multipath and frame noise)")
+        self.sigma_info = QtWidgets.QLabel()
+        self.sigma_info.setWordWrap(True)
         self.seed = ispin(0, 999_999, d.seed)
         self.new_terrain = QtWidgets.QPushButton("New terrain")
         self.new_terrain.setToolTip("Draw a new random shadowing and multipath pattern (changes the seed)")
         for w, key in ((self.d0, "d0"), (self.pl0, "pl0"), (self.n, "n"), (self.shadow, "shadow"),
-                       (self.corr, "corr"), (self.kf, "k"), (self.noise, "noise")):
+                       (self.corr, "corr"), (self.kf, "k"), (self.noise, "noise"), (self.dynamic, "dynamic"),
+                       (self.station_corr, "station_corr"), (self.sigma_total, "sigma_total")):
             w.setToolTip(TIPS[key])
-        note = QtWidgets.QLabel("Defaults: Bor et al. 2016 (built-up, links of about 40-100 m). These "
-                                "values describe one site; measure them for your own. Hover over a field "
-                                "to see its source.")
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#555; font-size:8pt")
-        f.addRow(note)
+        self.preset_note = QtWidgets.QLabel()
+        self.preset_note.setWordWrap(True)
+        self.preset_note.setStyleSheet("color:#555; font-size:8pt")
+        f.addRow("Preset", self.preset)
+        f.addRow(self.preset_note)
+        f.addRow("Path-loss model", self.model)
+        f.addRow("Ground", self.ground)
         f.addRow("Reference distance d0", self.d0)
         f.addRow("Path loss at d0", self.pl0)
         f.addRow("Path-loss exponent n", self.n)
         f.addRow("Shadowing σ", self.shadow)
+        f.addRow(self.sigma_total)
         f.addRow("Correlation distance", self.corr)
+        f.addRow("Station correlation ρ", self.station_corr)
         f.addRow("Multipath K-factor", self.kf)
+        f.addRow("Multipath changing per frame", self.dynamic)
         f.addRow("Frame noise σ", self.noise)
+        f.addRow(self.sigma_info)
         f.addRow("Seed", self.seed)
         f.addRow("", self.new_terrain)
         self.set_environment(d.env)
@@ -238,8 +289,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_frames = ispin(10, 500, d.scan_frames, 10)
         self.locate_frames = ispin(1, 200, d.locate_frames)
         self.test_points = ispin(100, 2000, d.test_points, 100)
+        self.scan_positions = ispin(1, 20, d.scan_positions)
+        self.locate_positions = ispin(1, 20, d.locate_positions)
+        for w in (self.scan_positions, self.locate_positions):
+            w.setToolTip(TIPS["positions"])
         f.addRow("Scan, per station", self.scan_frames)
         f.addRow("Localization, per station", self.locate_frames)
+        f.addRow("Scan positions per node", self.scan_positions)
+        f.addRow("Localization positions", self.locate_positions)
         f.addRow("Test points", self.test_points)
 
         g, f = self._group("Localization", form)
@@ -333,6 +390,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------- signals ----------
         self.new_terrain.clicked.connect(lambda: self.seed.setValue(random.randint(0, 999_999)))
+        self.preset.currentTextChanged.connect(self._preset_changed)
+        self.model.currentTextChanged.connect(self._model_changed)
         self.layout_.currentTextChanged.connect(self._layout_changed)
         self.run_button.clicked.connect(self.run_simulation)
         self.sweep_button.clicked.connect(self.run_sweep)
@@ -345,6 +404,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in panel.findChildren(QtWidgets.QComboBox):
             w.currentIndexChanged.connect(self._changed)
         self.table.itemChanged.connect(self._changed)
+        self.sigma_total.toggled.connect(self._changed)
         self._layout_changed(self.layout_.currentText())
         self._update_info()
         QtCore.QTimer.singleShot(0, self.run_simulation)
@@ -374,8 +434,23 @@ class MainWindow(QtWidgets.QMainWindow):
         sx, sy = (f"{v:.2f}".rstrip("0").rstrip(".") for v in actual_spacing(cfg))
         return f"{sx} m" if sx == sy else f"{sx} × {sy} m"
 
+    def _preset_changed(self, name):
+        self.set_environment(ENVIRONMENTS[name].env)
+
+    def _model_changed(self, name):
+        two_ray = name == "Two-ray"
+        for w in (self.d0, self.pl0, self.n):
+            w.setEnabled(not two_ray)
+        self.ground.setEnabled(two_ray)
+
     def set_environment(self, e):
         """Fill the propagation fields, e.g. with one of the parameter sets in lorasim.config."""
+        preset = next((name for name, p in ENVIRONMENTS.items() if p.env == e), None)
+        if preset is not None:
+            self.preset_note.setText(ENVIRONMENTS[preset].source + " Hover over a field to see its source.")
+        self.model.setCurrentText(e.path_loss_model)
+        self.ground.setCurrentText(e.ground)
+        self._model_changed(e.path_loss_model)
         self.d0.setValue(e.reference_distance)
         self.pl0.setValue(e.reference_loss)
         self.n.setValue(e.path_loss_exponent)
@@ -383,6 +458,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.corr.setValue(e.correlation_distance)
         self.kf.setValue(e.k_factor_db)
         self.noise.setValue(e.frame_noise_sigma)
+        self.dynamic.setValue(e.dynamic_share * 100)
+        self.station_corr.setValue(e.station_correlation)
+        self.sigma_total.setChecked(e.sigma_includes_fading)
 
     def _changed(self, *_):
         self._update_info()
@@ -403,6 +481,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if abs(sx - cfg.grid_spacing) > 1e-6 or abs(sy - cfg.grid_spacing) > 1e-6:
                 text += f"<br>actual spacing {sx:.2f} × {sy:.2f} m (grid covers the whole area)"
         self.grid_info.setText(text)
+        sigma, consistent = shadowing_sigma_used(cfg.env)
+        self.sigma_info.setStyleSheet("color:#555" if consistent else "color:#b00020")
+        if not cfg.env.sigma_includes_fading:
+            self.sigma_info.setText("")
+        elif consistent:
+            self.sigma_info.setText(f"Shadowing used: {sigma:.2f} dB (rest of the total σ after "
+                                    "multipath and frame noise)")
+        else:
+            self.sigma_info.setText("Multipath and frame noise alone spread more than the total σ: "
+                                    "shadowing set to 0. Raise the K-factor or lower the frame noise.")
         r = cfg.radio
         airtime = radio.time_on_air_ms(r.spreading_factor, r.bandwidth_khz, r.payload_bytes)
         sens = radio.sensitivity_dbm(r.spreading_factor, r.bandwidth_khz, r.noise_figure_db)
@@ -421,7 +509,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except (AttributeError, ValueError):
                 raise ValueError(f"Station S{i + 1}: coordinates must be numbers") from None
         env = Environment(self.d0.value(), self.pl0.value(), self.n.value(), self.shadow.value(),
-                          self.corr.value(), self.kf.value(), self.noise.value())
+                          self.corr.value(), self.kf.value(), self.noise.value(),
+                          dynamic_share=self.dynamic.value() / 100,
+                          station_correlation=self.station_corr.value(),
+                          sigma_includes_fading=self.sigma_total.isChecked(),
+                          path_loss_model=self.model.currentText(), ground=self.ground.currentText())
         rad = Radio(sub_band=self.sub_band.currentText(), bandwidth_khz=float(self.bw.currentText()),
                     spreading_factor=int(self.sf.currentText()), tx_power_dbm=self.tx.value(),
                     antenna_gain_dbi=self.gain.value(), noise_figure_db=self.nf.value(),
@@ -430,7 +522,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return Config(width=self.width_.value(), height=self.height_.value(),
                       grid_spacing=self.spacing.value(), station_layout=self.layout_.currentText(),
                       manual_stations=tuple(stations), radio=rad, env=env,
+                      station_height=self.station_height.value(),
+                      receiver_height=self.receiver_height.value(),
                       scan_frames=self.scan_frames.value(), locate_frames=self.locate_frames.value(),
+                      scan_positions=self.scan_positions.value(),
+                      locate_positions=self.locate_positions.value(),
                       test_points=self.test_points.value(), algorithm=self.algorithm.currentText(),
                       k=self.k.value(), features=self.features.currentText(), seed=self.seed.value())
 
@@ -498,6 +594,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if result.max_link_m > hi * 1.05 or result.max_link_m < lo:
                 notes.append(f"links up to {fmt_len(result.max_link_m)} are outside the range of the "
                              f"source of these propagation values ({lo:g}-{hi:g} m)")
+        if not result.scenario.sigma_consistent:
+            notes.append("multipath and frame noise spread more than the total σ, shadowing set to 0")
         if any(getattr(f, "coarse", False) for f in result.scenario.shadow):
             notes.append("shadowing raster is coarser than 1/10 of the correlation distance")
         if cfg.radio.erp_dbm > cfg.radio.erp_limit_dbm + 1e-9:
@@ -672,7 +770,9 @@ class MainWindow(QtWidgets.QMainWindow):
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh)
             fh.write(f"# area {cfg.width:g} x {cfg.height:g} m, grid {self._spacing_text(cfg)}, "
-                     f"SF{cfg.radio.spreading_factor}, {cfg.scan_frames} frames per station\n")
+                     f"SF{cfg.radio.spreading_factor}, {cfg.scan_frames} frames per station, "
+                     f"{cfg.env.path_loss_model} model, station antennas {cfg.station_height:g} m, "
+                     f"receiver {cfg.receiver_height:g} m\n")
             for i, (x, y) in enumerate(r.scenario.stations):
                 fh.write(f"# station S{i + 1}: x={x:.2f} m, y={y:.2f} m\n")
             n = len(r.scenario.stations)
