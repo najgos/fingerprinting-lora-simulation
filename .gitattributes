@@ -1,0 +1,2 @@
+# Windows batch files keep CRLF line endings in the repository, so they also work from a downloaded ZIP.
+*.bat -text
