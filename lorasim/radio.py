@@ -1,11 +1,10 @@
-"""LoRa link parameters: time on air, noise floor, sensitivity and SX1262 reporting."""
+"""LoRa link parameters: time on air, noise floor, sensitivity and SX1262 RSSI reporting."""
 import math
 
 import numpy as np
 
 # Demodulation SNR limit per spreading factor (Semtech AN1200.13, SX127x; not confirmed for SX1262)
 SNR_LIMIT_DB = {7: -7.5, 8: -10.0, 9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0}
-SNR_REPORT_MAX_DB = 12.0   # default saturation of the packet SNR estimate (assumption)
 CODING_RATE = 1            # fixed: 4/5
 PREAMBLE_SYMBOLS = 8       # fixed
 
@@ -34,8 +33,3 @@ def reported_rssi(signal_dbm, noise_dbm):
     """SX1262 packet RSSI measures signal plus noise, 0.5 dB steps."""
     total = 10 * np.log10(10 ** (signal_dbm / 10) + 10 ** (noise_dbm / 10))
     return np.round(total * 2) / 2
-
-
-def reported_snr(snr_db, max_db=SNR_REPORT_MAX_DB):
-    """SX1262 packet SNR, 0.25 dB steps, saturating for strong signals."""
-    return np.round(np.minimum(snr_db, max_db) * 4) / 4

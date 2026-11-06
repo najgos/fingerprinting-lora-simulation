@@ -27,20 +27,60 @@ def path_loss_db(distance_m, env, frequency_mhz):
     return np.maximum(pl, free_space_loss_db(d, frequency_mhz))
 
 
-# ITU-R P.2040-1 Table 3: relative permittivity a * f^b and conductivity c * f^d (S/m), f in GHz.
-# The table gives these ground types for 1-10 GHz; 868 MHz is slightly below that range.
+# Ground: soil model of ITU-R P.527-6 § 5.2 (valid at all frequencies up to 1000 GHz).
+# Soil texture: silty loam from Table 2; temperature 23 °C as in Figs 14-16 of the Recommendation.
+SOIL = {"sand": 30.63, "clay": 13.48, "rho_s": 2.59, "rho_b": 1.5750, "temperature_c": 23.0}
+# Volumetric water content (m3/m3). 0.07 and 0.5 are the dry and wet soil examples of P.527-6;
+# 0.3 is an assumption between them.
 GROUND_TYPES = {
-    "Medium dry ground": (15.0, -0.1, 0.035, 1.63),
-    "Wet ground": (30.0, -0.4, 0.15, 1.30),
-    "Very dry ground": (3.0, 0.0, 0.00015, 2.52),
+    "Dry soil (7 % water)": 0.07,
+    "Moist soil (30 % water)": 0.30,
+    "Wet soil (50 % water)": 0.50,
 }
 
 
+def pure_water_debye(f_ghz, temperature_c):
+    """ITU-R P.527-6 eqs (6)-(13): real and imaginary part of the permittivity of pure water."""
+    theta = 300 / (temperature_c + 273.15) - 1
+    eps_s = 77.66 + 103.3 * theta
+    eps_1 = 0.0671 * eps_s
+    eps_inf = 3.52 - 7.52 * theta
+    f1 = 20.20 - 146.4 * theta + 316 * theta ** 2
+    f2 = 39.8 * f1
+    real = (eps_s - eps_1) / (1 + (f_ghz / f1) ** 2) + (eps_1 - eps_inf) / (1 + (f_ghz / f2) ** 2) + eps_inf
+    imag = ((f_ghz / f1) * (eps_s - eps_1) / (1 + (f_ghz / f1) ** 2)
+            + (f_ghz / f2) * (eps_1 - eps_inf) / (1 + (f_ghz / f2) ** 2))
+    return real, imag
+
+
+def soil_permittivity(f_ghz, water_content, sand, clay, rho_s, rho_b, temperature_c):
+    """ITU-R P.527-6 eqs (58)-(70): complex relative permittivity eps' - j eps'' of soil.
+
+    Mixture of soil particles (sand, clay, silt), air, bound water and free water; `water_content`
+    is the volumetric water content mv, sand and clay are percentages by volume.
+    """
+    alpha = 0.65
+    beta_re = 1.2748 - 0.00519 * sand - 0.00152 * clay
+    beta_im = 1.33797 - 0.00603 * sand - 0.00166 * clay
+    eps_sm = (1.01 + 0.44 * rho_s) ** 2 - 0.062
+    sigma_1 = 0.0467 + 0.2204 * rho_b - 0.004111 * sand - 0.006614 * clay
+    sigma_2 = -1.645 + 1.939 * rho_b - 0.0225622 * sand + 0.01594 * clay
+    x = f_ghz / 1.35
+    sigma_re = x * (sigma_1 - sigma_2) / (1 + x ** 2)
+    sigma_im = sigma_2 + (sigma_1 - sigma_2) / (1 + x ** 2)
+    water_re, water_im = pure_water_debye(f_ghz, temperature_c)
+    conduction = 18 / f_ghz * (rho_s - rho_b) / (rho_s * water_content)
+    free_re = water_re + sigma_re * conduction
+    free_im = water_im + sigma_im * conduction
+    real = (1 + rho_b / rho_s * (eps_sm ** alpha - 1)
+            + water_content ** beta_re * free_re ** alpha - water_content) ** (1 / alpha)
+    imag = (water_content ** beta_im * free_im ** alpha) ** (1 / alpha)
+    return complex(real, -imag)
+
+
 def ground_permittivity(ground, frequency_mhz):
-    """Complex relative permittivity of the ground: eps_r - j sigma / (2 pi f eps0)."""
-    a, b, c, d = GROUND_TYPES[ground]
-    f_ghz = frequency_mhz / 1000
-    return a * f_ghz ** b - 1j * 17.98 * c * f_ghz ** d / f_ghz
+    """Complex relative permittivity of the ground type at the given frequency."""
+    return soil_permittivity(frequency_mhz / 1000, GROUND_TYPES[ground], **SOIL)
 
 
 def ground_reflection(sin_grazing, eps_c):
@@ -145,13 +185,18 @@ def _k_linear(k_factor_db, k_rayleigh):
     return 0.0 if k_factor_db <= k_rayleigh else 10 ** (k_factor_db / 10)
 
 
+def los_amplitude(k_factor_db, k_rayleigh, k_none):
+    """Amplitude of the line-of-sight part when the total mean power is 1 (scattered power 1 - los^2)."""
+    if k_factor_db >= k_none:
+        return 1.0
+    k_lin = _k_linear(k_factor_db, k_rayleigh)
+    return math.sqrt(k_lin / (k_lin + 1))
+
+
 def rice_amplitude(k_factor_db, size, rng, k_rayleigh, k_none):
     """Complex amplitude with mean power 1: line-of-sight part plus Gaussian scattered part."""
-    if k_factor_db >= k_none:
-        return np.ones(size, dtype=complex)
-    k_lin = _k_linear(k_factor_db, k_rayleigh)
-    los = math.sqrt(k_lin / (k_lin + 1))
-    s = math.sqrt(1 / (2 * (k_lin + 1)))
+    los = los_amplitude(k_factor_db, k_rayleigh, k_none)
+    s = math.sqrt((1 - los ** 2) / 2)
     return los + s * (rng.standard_normal(size) + 1j * rng.standard_normal(size))
 
 
@@ -175,15 +220,19 @@ def multipath_db(k_factor_db, size, rng, k_rayleigh, k_none):
     return _rice_power_db(k_lin, size, rng) - _RICE_OFFSET[k_lin]
 
 
-def dynamic_gain_db(fixed, dynamic_share, rng):
-    """Power gain in dB of single frames: fixed part of the channel plus a part new in every frame.
+def dynamic_gain_db(fixed, dynamic_share, rng, los):
+    """Power gain in dB of single frames: the line of sight stays, the scattered part changes in part.
 
-    `fixed` holds the complex amplitudes (mean power 1) at the position of each frame. A share
-    `dynamic_share` of the multipath power changes from frame to frame (moving people, vehicles,
-    leaves); frames are independent. Zero mean in dB, as in multipath_db.
+    `fixed` holds the complex amplitudes (from rice_amplitude, mean power 1) at the position of each
+    frame and `los` their line-of-sight part. A share `dynamic_share` of the scattered (multipath)
+    power is new in every frame (moving people, vehicles, leaves); frames are independent. The line
+    of sight is not affected, so the K-factor and the mean power stay the same. The mean in dB is
+    not removed here (see fading_stats_db).
     """
-    h = math.sqrt(1 - dynamic_share) * fixed + math.sqrt(dynamic_share / 2) * (
+    scattered_power = 1 - los ** 2
+    new = math.sqrt(dynamic_share * scattered_power / 2) * (
         rng.standard_normal(fixed.shape) + 1j * rng.standard_normal(fixed.shape))
+    h = los + math.sqrt(1 - dynamic_share) * (fixed - los) + new
     return 10 * np.log10(np.abs(h) ** 2)
 
 
@@ -191,10 +240,12 @@ def fading_stats_db(k_factor_db, dynamic_share, k_rayleigh, k_none):
     """Mean and standard deviation in dB of the single-frame multipath gain (fixed and dynamic part)."""
     key = (float(k_factor_db), float(dynamic_share))
     if key not in _FADING_STATS:
-        if k_factor_db >= k_none and dynamic_share <= 0:
-            _FADING_STATS[key] = (0.0, 0.0)
+        if k_factor_db >= k_none:
+            _FADING_STATS[key] = (0.0, 0.0)            # no multipath: nothing to change either
         else:
             rng = np.random.default_rng(12345)
-            g = dynamic_gain_db(rice_amplitude(k_factor_db, 400_000, rng, k_rayleigh, k_none), dynamic_share, rng)
+            los = los_amplitude(k_factor_db, k_rayleigh, k_none)
+            fixed = rice_amplitude(k_factor_db, 400_000, rng, k_rayleigh, k_none)
+            g = dynamic_gain_db(fixed, dynamic_share, rng, los)
             _FADING_STATS[key] = (float(g.mean()), float(g.std()))
     return _FADING_STATS[key]

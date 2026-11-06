@@ -1,11 +1,10 @@
 """Scan, localization and accuracy evaluation."""
-import math
 from dataclasses import dataclass
 
 import numpy as np
 
 from . import propagation, radio
-from .config import K_NONE, K_RAYLEIGH, MAX_GRID_POINTS, NO_SIGNAL_RSSI, NO_SIGNAL_SNR, Config
+from .config import K_NONE, K_RAYLEIGH, MAX_GRID_POINTS, NO_SIGNAL_RSSI, Config
 
 MAX_SAMPLES_PER_CHUNK = 2_000_000
 
@@ -58,21 +57,6 @@ class Scenario:
     airtime_ms: float           # one frame on air
     slot_ms: float              # one frame plus the guard gap
     rngs: dict
-    shadow_sigma: float         # shadowing sigma actually used (dB)
-    sigma_consistent: bool      # False: the given total sigma is smaller than fading plus frame noise
-
-
-def shadowing_sigma_used(env):
-    """Shadowing sigma to simulate, and whether the settings are consistent.
-
-    With sigma_includes_fading the given sigma is the total spread of single frames, so the
-    multipath and frame-noise spread are taken out of it: sigma_s^2 = sigma^2 - sigma_mp^2 - sigma_n^2.
-    """
-    if not env.sigma_includes_fading:
-        return env.shadowing_sigma, True
-    _, fading = propagation.fading_stats_db(env.k_factor_db, env.dynamic_share, K_RAYLEIGH, K_NONE)
-    rest = env.shadowing_sigma ** 2 - fading ** 2 - env.frame_noise_sigma ** 2
-    return math.sqrt(max(rest, 0.0)), rest >= -1e-9
 
 
 def build_scenario(cfg):
@@ -85,7 +69,7 @@ def build_scenario(cfg):
 
     env, r = cfg.env, cfg.radio
     stations = station_positions(cfg, rngs["stations"])
-    sigma, consistent = shadowing_sigma_used(env)
+    sigma = env.shadowing_sigma
     shadow = [propagation.ShadowField(cfg.width, cfg.height, sigma, env.correlation_distance, rngs["shadow"])
               for _ in stations]
     if env.station_correlation > 0 and sigma > 0:
@@ -97,12 +81,7 @@ def build_scenario(cfg):
     airtime = radio.time_on_air_ms(r.spreading_factor, r.bandwidth_khz, r.payload_bytes)
     return Scenario(cfg, stations, gx, gy, np.column_stack([xx.ravel(), yy.ravel()]),
                     shadow, radio.noise_floor_dbm(r.bandwidth_khz, r.noise_figure_db),
-                    radio.SNR_LIMIT_DB[r.spreading_factor], airtime, airtime + r.guard_ms, rngs,
-                    sigma, consistent)
-
-
-def link_distances(sc, points):
-    return np.hypot(points[:, None, 0] - sc.stations[None, :, 0], points[:, None, 1] - sc.stations[None, :, 1])
+                    radio.SNR_LIMIT_DB[r.spreading_factor], airtime, airtime + r.guard_ms, rngs)
 
 
 def mean_power(sc, points):
@@ -121,7 +100,6 @@ def mean_power(sc, points):
 @dataclass
 class Measurement:
     rssi: np.ndarray        # (P, S) mean reported RSSI, NO_SIGNAL_RSSI if nothing arrived
-    snr: np.ndarray         # (P, S) mean reported SNR
     received: np.ndarray    # (P, S) number of frames received
     frames: int
 
@@ -130,10 +108,10 @@ def measure(sc, points, frames, rng, positions=1):
     """The receiver stands at each point and averages `frames` frames from every station.
 
     Multipath: every receiver position has its own fixed part (Rice with the K-factor); a share
-    env.dynamic_share of the multipath power is new in every frame. With several positions the
-    receiver is moved around the point (positions more than half a wavelength apart, close
-    compared with the shadowing correlation distance) and the frames are spread over them in turn,
-    so averaging also reduces the fixed part.
+    env.dynamic_share of the scattered power is new in every frame, the line of sight stays. With
+    several positions the receiver is moved around the point (positions more than half a wavelength
+    apart, close compared with the shadowing correlation distance) and the frames are spread over
+    them in turn, so averaging also reduces the fixed part.
     """
     env = sc.cfg.env
     base = mean_power(sc, points)
@@ -141,6 +119,7 @@ def measure(sc, points, frames, rng, positions=1):
     share = env.dynamic_share
     shape = base.shape + (n_pos,)
     if share > 0:
+        los = propagation.los_amplitude(env.k_factor_db, K_RAYLEIGH, K_NONE)
         fixed = propagation.rice_amplitude(env.k_factor_db, shape, rng, K_RAYLEIGH, K_NONE)
         offset = propagation.fading_stats_db(env.k_factor_db, share, K_RAYLEIGH, K_NONE)[0]
     else:
@@ -148,31 +127,23 @@ def measure(sc, points, frames, rng, positions=1):
     position_of_frame = np.arange(frames) % n_pos
     n_st = base.shape[1]
     rssi = np.empty_like(base)
-    snr = np.empty_like(base)
     received = np.empty(base.shape, dtype=int)
     chunk = max(1, MAX_SAMPLES_PER_CHUNK // (n_st * frames))
     for a in range(0, len(points), chunk):
         b = slice(a, a + chunk)
         if share > 0:
-            multipath = propagation.dynamic_gain_db(fixed[b][:, :, position_of_frame], share, rng) - offset
+            multipath = propagation.dynamic_gain_db(fixed[b][:, :, position_of_frame], share, rng, los) - offset
         else:
             multipath = fixed[b][:, :, position_of_frame]
         power = (base[b, :, None] + multipath
                  + rng.normal(0.0, env.frame_noise_sigma, (len(base[b]), n_st, frames)))
-        snr_true = power - sc.noise_floor
-        ok = snr_true >= sc.snr_limit
+        ok = power - sc.noise_floor >= sc.snr_limit       # frame decoded when its SNR is above the limit
         count = ok.sum(axis=2)
         with np.errstate(invalid="ignore", divide="ignore"):
             rssi[b] = np.where(ok, radio.reported_rssi(power, sc.noise_floor), 0).sum(axis=2) / count
-            snr[b] = np.where(ok, radio.reported_snr(snr_true, sc.cfg.radio.snr_report_max_db), 0).sum(axis=2) / count
         received[b] = count
     rssi[received == 0] = NO_SIGNAL_RSSI
-    snr[received == 0] = NO_SIGNAL_SNR
-    return Measurement(rssi, snr, received, frames)
-
-
-def features(m, kind):
-    return m.rssi if kind == "RSSI" else np.hstack([m.rssi, m.snr])
+    return Measurement(rssi, received, frames)
 
 
 def nearest_neighbours(map_features, map_points, query, k):
@@ -203,7 +174,6 @@ class Result:
     locate_time_s: float
     locates_per_hour: float     # allowed by the duty cycle of one station
     frame_loss: float
-    max_link_m: float           # longest station - grid node distance
 
     @property
     def cfg(self):
@@ -227,14 +197,12 @@ def simulate(cfg, algorithms=None, test_points=None):
     estimates = {}
     for alg in algorithms:
         k = 1 if alg == "NN" else cfg.k
-        estimates[alg] = nearest_neighbours(features(scan, cfg.features), sc.grid,
-                                            features(located, cfg.features), k)
+        estimates[alg] = nearest_neighbours(scan.rssi, sc.grid, located.rssi, k)
     errors = {a: np.linalg.norm(e - test_points, axis=1) for a, e in estimates.items()}
 
     times = timing(sc, len(sc.grid))
     loss = 1 - scan.received.sum() / (len(sc.grid) * len(sc.stations) * cfg.scan_frames)
-    return Result(sc, scan, test_points, located, estimates, errors, *times, float(loss),
-                  float(link_distances(sc, sc.grid).max()))
+    return Result(sc, scan, test_points, located, estimates, errors, *times, float(loss))
 
 
 def timing(sc, points):
