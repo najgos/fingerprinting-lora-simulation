@@ -103,17 +103,10 @@ The current figure can be saved as PNG and the fingerprint map exported as CSV
 
 Requires Python 3.10 or newer.
 
-**Windows:** double-click `run.bat`. The first start creates a virtual environment in
+Double-click `run.bat`. The first start creates a virtual environment in
 `%LOCALAPPDATA%\lora-fingerprinting-sim\venv` and installs the packages (a few minutes); later starts
 open the application directly. The short path avoids the Windows path-length limit that Qt files
 hit when the project sits in a deep folder.
-
-**Any system, from a terminal opened in the project folder:**
-
-```
-pip install -r requirements.txt
-python app.py
-```
 
 ## Project layout
 
