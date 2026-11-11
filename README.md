@@ -1,5 +1,7 @@
 # LoRa Fingerprinting Simulator
 
+[![Tests](https://github.com/najgos/fingerprinting-lora-simulation/actions/workflows/tests.yml/badge.svg)](https://github.com/najgos/fingerprinting-lora-simulation/actions/workflows/tests.yml)
+
 Desktop application that simulates RSSI fingerprinting localization with LoRa (868 MHz): four fixed
 base stations and one hand-held receiver. It estimates the localization error and the time needed for
 the field work for a given site, radio configuration and grid.
@@ -108,6 +110,17 @@ Double-click `run.bat`. The first start creates a virtual environment in
 open the application directly. The short path avoids the Windows path-length limit that Qt files
 hit when the project sits in a deep folder.
 
+## Tests
+
+The model in `lorasim/` is covered by unit tests (pytest); the code is checked with ruff. GitHub
+Actions runs both on every push, on Windows and Linux with Python 3.10 and 3.13.
+
+```
+python -m pip install -r requirements-dev.txt
+python -m ruff check .
+python -m pytest
+```
+
 ## Project layout
 
 ```
@@ -118,5 +131,7 @@ lorasim/radio.py        time on air, noise floor, sensitivity, reported RSSI
 lorasim/propagation.py  path loss (log-distance, two-ray), correlated shadowing, Ricean multipath
 lorasim/simulation.py   scan, localization (NN, WkNN), timing, evaluation
 lorasim/sweep.py        error as a function of one parameter
+tests/                  unit tests (pytest)
+.github/workflows/      CI: lint and tests on Windows and Linux
 docs/                   screenshots
 ```
