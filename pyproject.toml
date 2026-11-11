@@ -1,0 +1,13 @@
+# Tool settings only: the application is started with run.bat, not installed as a package.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]       # lets the tests import lorasim from the project folder
+addopts = "-ra"          # short summary of skipped and failed tests at the end
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]   # pycodestyle errors and warnings, pyflakes, import order
